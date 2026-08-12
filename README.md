@@ -108,6 +108,39 @@ verify pass to report as missing. Teardown attempts a graceful SMB shutdown and
 force-closes the tunnel if it blocks, since a wedged transfer would otherwise hold the
 device's only session.
 
+## Sharp edges
+
+This is a reverse-engineered stack built to make `download` work — bulk device-to-client
+transfer over SMB, plus request/response for JSON-RPC and Alpaca. Those paths are solid.
+Other uses, especially through `proxy`, run into limits that were never the focus:
+
+- **No liveness detection.** The tunnel sends keepalives at several layers but never reads
+  the replies, and nothing times out on silence. A tunnel that wedges mid-session does not
+  error — it goes quiet. A `proxy` client then hangs with no feedback, and a CIFS mount
+  over `proxy` can leave uninterruptible (D-state) processes. `download` works around this
+  with its own per-file stall timeouts and a force-close teardown watchdog; `proxy` has
+  none, so recovery is killing the process.
+
+- **No outbound retransmission.** RDT is reliable inbound — the device resends when we
+  signal a gap — but the client-to-device direction has no retransmit buffer. A single
+  dropped outbound frame stalls the stream. `download` sends almost nothing upward (small
+  SMB requests) so it is unaffected, but proxying a port where the client pushes data to
+  the device can stall on packet loss, most likely on a lossy or high-RTT path and with
+  large transfers.
+
+- **One session, one client per port.** The device accepts a single remote Kalay session,
+  so a running `proxy` or `download` occupies the scope — the phone app and the other tool
+  cannot connect meanwhile. Each mapped port serves one client at a time; a second is
+  refused.
+
+- **`proxy` is a byte pipe.** It does not parse the tunnelled protocols. On a dial failure
+  it injects an error the client may not understand, and it cannot retry or recover a
+  mid-stream failure — that is the client's problem.
+
+- **Narrow, moving target.** Verified against a Seestar S30 Pro on one firmware. ZWO's
+  cloud API is private and unversioned, and ports and behaviour move across models and
+  firmware, so any of this can break without notice.
+
 ## Layout
 
 - `kalay/` — the reversed transport: control, session, dtls, rdt, tunnel.
