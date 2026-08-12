@@ -141,6 +141,11 @@ Other uses, especially through `proxy`, run into limits that were never the focu
   cloud API is private and unversioned, and ports and behaviour move across models and
   firmware, so any of this can break without notice.
 
+- **`download` verifies by size, not content.** `VERIFIED COMPLETE` means every device file
+  is present locally at the exact byte length; it does not hash. A full-length but corrupt
+  file passes. The most likely source of that — a short read leaving a sparse hole — is
+  guarded against, so the risk is low, but the check is not integrity.
+
 ## Layout
 
 - `kalay/` — the reversed transport: control, session, dtls, rdt, tunnel.
