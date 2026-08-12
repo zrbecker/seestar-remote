@@ -1,0 +1,9 @@
+/bin/
+/proxy
+/download
+*.pcap
+*.cap
+*.part
+*.log
+ch.hex
+.env*
