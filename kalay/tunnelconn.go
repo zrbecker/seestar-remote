@@ -32,6 +32,20 @@ type Tunnel struct {
 	devConn byte
 	txSeq   uint64 // RDT reliable-stream sequence (client->device data/control)
 
+	// outbound go-back-N reliability (see gobackn.go); owned by the pump goroutine
+	inflight   map[uint64]*outFrame
+	sendBase   uint64
+	srtt       time.Duration
+	rttvar     time.Duration
+	rto        time.Duration
+	lastReTx   time.Time
+	lastProg   time.Time
+	dupAcks    int
+	retxRun    int
+	lastAckSeq uint64
+	cwnd       float64   // AIMD congestion window in frames; grows on ACK progress, halves on loss/stall
+	cwndCut    time.Time // last multiplicative decrease, so a burst of retransmits halves cwnd only once
+
 	writeCh chan writeReq
 	ctrlCh  chan []byte // raw P2PTunnel control payloads to send (e.g. channel-close frames)
 	closed  chan struct{}
@@ -379,6 +393,8 @@ func (t *Tunnel) pump(buf []byte) {
 	}()
 	lastKA := time.Now()
 	lastHB := time.Now()
+	t.initGoBackN()
+	var pending bytes.Buffer // outbound chunk bytes awaiting framing; bounds the caller's Write
 	for {
 		select {
 		case <-t.closed:
@@ -386,8 +402,8 @@ func (t *Tunnel) pump(buf []byte) {
 		default:
 		}
 		if tunDebug && time.Since(lastHB) > 2*time.Second {
-			fmt.Fprintf(os.Stderr, "[tun] HB txSeq=%d appSeq=%d pumpNext=%d maxSeq=%d writeChLen=%d\n",
-				t.txSeq, t.appSeq, t.pumpNext, t.recv.MaxSeq(), len(t.writeCh))
+			fmt.Fprintf(os.Stderr, "[tun] HB txSeq=%d appSeq=%d pumpNext=%d maxSeq=%d writeChLen=%d cwnd=%.1f inflight=%d rto=%s\n",
+				t.txSeq, t.appSeq, t.pumpNext, t.recv.MaxSeq(), len(t.writeCh), t.cwnd, t.txSeq-t.sendBase, t.rto)
 			lastHB = time.Now()
 		}
 		if time.Since(lastKA) > 400*time.Millisecond {
@@ -406,8 +422,7 @@ func (t *Tunnel) pump(buf []byte) {
 			if tunDebug {
 				fmt.Fprintf(os.Stderr, "[tun] send portConnect idx=%d port=%d seq=%d: %x\n", pv.idx, pv.port, t.txSeq, p2pPortConnect(pv.idx, pv.port))
 			}
-			t.sendRDT(0x02, 0x01, t.devConn, t.txSeq, p2pPortConnect(pv.idx, pv.port))
-			t.txSeq++
+			t.sendReliable(0x02, 0x01, t.devConn, p2pPortConnect(pv.idx, pv.port))
 			pv.sentPortConn = true
 		}
 		t.povmu.Unlock()
@@ -418,36 +433,38 @@ func (t *Tunnel) pump(buf []byte) {
 				if tunDebug {
 					fmt.Fprintf(os.Stderr, "[tun] send ctrl seq=%d: %x\n", t.txSeq, cb)
 				}
-				t.sendRDT(0x02, 0x01, t.devConn, t.txSeq, cb)
-				t.txSeq++
+				t.sendReliable(0x02, 0x01, t.devConn, cb)
 				continue
 			default:
 			}
 			break
 		}
-		// drain outbound writes
-		for {
+		// Accumulate outbound P2PTunnel chunks (02 <chan> <len16> <bytes>) into a byte stream,
+		// bounded to about one window so writeChan -> the caller's Write backpressures.
+		for pending.Len() < sendWindow*maxFrame {
 			select {
 			case w := <-t.writeCh:
-				// One P2PTunnel data chunk (02 <chan> <len16> <bytes>), split across MTU-safe RDT
-				// frames so each DTLS record fits a single UDP datagram; oversized datagrams are
-				// dropped by the relay. The device reassembles using the chunk length.
 				p := w.data
-				chunk := append([]byte{0x02, w.idx, byte(len(p)), byte(len(p) >> 8)}, p...)
-				const maxFrame = 1024
-				for off := 0; off < len(chunk); off += maxFrame {
-					end := min(off+maxFrame, len(chunk))
-					t.sendRDT(0x02, 0x01, t.devConn, t.txSeq, chunk[off:end])
-					t.txSeq++
-				}
+				pending.Write([]byte{0x02, w.idx, byte(len(p)), byte(len(p) >> 8)})
+				pending.Write(p)
 				continue
 			default:
 			}
 			break
+		}
+		// Frame the stream into <=maxFrame RDT frames, sending only while the congestion window has
+		// room, so one large write cannot blast thousands of frames past the window and flood the
+		// relay or overrun the device's receive buffer. RDT is a byte stream, so framing across chunk
+		// boundaries is fine.
+		for pending.Len() > 0 && t.txSeq-t.sendBase < t.cwndFrames() {
+			t.sendReliable(0x02, 0x01, t.devConn, pending.Next(min(maxFrame, pending.Len())))
 		}
 		// inbound
 		for _, f := range t.readRDT(buf, 200*time.Millisecond) {
 			if f.Type != 0x02 {
+				if f.Type == 0x46 { // device cumulative ACK of our reliable stream
+					t.ackOutbound(f.Seq)
+				}
 				if tunDebug && ackLogCount < 30 && (f.Type == 0x46 || f.Type == 0x41 || f.Type == 0x4e) {
 					fmt.Fprintf(os.Stderr, "[rdt] dev ctrl type=%#x seq=%d b16=%d conn=%d paylen=%d pay=%x\n",
 						f.Type, f.Seq, f.B16, f.ConnID, len(f.Payload), f.Payload)
@@ -459,6 +476,15 @@ func (t *Tunnel) pump(buf []byte) {
 			// gap tells the device the missing seq was received, suppressing its retransmit and
 			// stalling the stream permanently. Only the highest contiguous seq is acked, below.
 			t.recv.Add(f.Seq, f.Payload)
+		}
+		if err := t.outboundTick(); err != nil {
+			t.rmu.Lock()
+			if t.rerr == nil {
+				t.rerr = err
+			}
+			t.rmu.Unlock()
+			t.closeMu.Do(func() { close(t.closed) }) // unblock writers waiting on t.closed
+			return
 		}
 		// Consume the in-order prefix incrementally: Take frees each consumed frame, bounding memory
 		// to the working set, and only the unparsed remainder is re-scanned. Rebuilding the whole
@@ -556,8 +582,7 @@ func (t *Tunnel) route(m PTunMsg) {
 			if tunDebug {
 				fmt.Fprintf(os.Stderr, "[tun] 0d reply: %x -> send connectAddr idx=%d port=%d seq=%d: %x\n", m.Data, pv.idx, pv.port, t.txSeq, p2pConnectAddr(pv.idx, pv.port))
 			}
-			t.sendRDT(0x02, 0x01, t.devConn, t.txSeq, p2pConnectAddr(pv.idx, pv.port))
-			t.txSeq++
+			t.sendReliable(0x02, 0x01, t.devConn, p2pConnectAddr(pv.idx, pv.port))
 			t.pendingV = nil
 			select {
 			case pv.done <- nil:

@@ -8,6 +8,7 @@ the Seestar's own services over that tunnel.
 |------|-------------------|
 | **proxy**    | local TCP ports mapped to the device's services over one tunnel |
 | **download**  | a resumable, self-verifying archive downloader |
+| **upload**    | writes local files (or a whole directory) into the device's image share |
 
 ## How it works
 
@@ -41,6 +42,7 @@ ZWO's cloud API is private and unversioned; it can change without notice.
 ```
 go build -o bin/proxy     ./cmd/proxy
 go build -o bin/download  ./cmd/download
+go build -o bin/upload    ./cmd/upload
 ```
 
 ## proxy
@@ -108,11 +110,37 @@ verify pass to report as missing. Teardown attempts a graceful SMB shutdown and
 force-closes the tunnel if it blocks, since a wedged transfer would otherwise hold the
 device's only session.
 
+## upload
+
+```
+bin/upload <local_path> <device_rel_path>
+```
+
+Writes a file into the device's SMB image share, creating any missing parent directories and
+reading the size back to confirm. A directory argument uploads every file beneath it in one
+session, preserving structure — one session avoids the per-session cooldown the device imposes
+after each disconnect.
+
+Env: `SHARE` (default `EMMC Images`), `ROOT` (default `MyWorks`), `SMB_USER` (default `Guest`),
+`UPLOAD_CHUNK` (SMB write size, default 8192), `UPLOAD_WORKERS` (concurrent writers, default 16).
+
+```
+bin/upload ./finals M31/finals          # a directory
+bin/upload ./M31.fit finals/M31.fit     # a single file
+```
+
+Each file is streamed as small SMB writes dispatched to a pool of concurrent `WriteAt` workers.
+Two constraints shape this: a single SMB write larger than the tunnel's send window deadlocks (the
+device won't acknowledge a partial write, so the window fills and never slides), so writes stay
+well under it; and go-smb2's write is synchronous, one round trip per write, so concurrency is what
+keeps the window full. Throughput is ultimately bounded by the device's receive buffer times the
+round-trip time — on a typical remote path a few hundred KB/s.
+
 ## Sharp edges
 
-This is a reverse-engineered stack built to make `download` work — bulk device-to-client
-transfer over SMB, plus request/response for JSON-RPC and Alpaca. Those paths are solid.
-Other uses, especially through `proxy`, run into limits that were never the focus:
+This is a reverse-engineered stack built around SMB bulk transfer — `download` and `upload` —
+plus request/response for JSON-RPC and Alpaca. Those paths are solid. Other uses, especially
+through raw `proxy`, run into limits that were never the focus:
 
 - **No liveness detection.** The tunnel sends keepalives at several layers but never reads
   the replies, and nothing times out on silence. A tunnel that wedges mid-session does not
@@ -121,12 +149,12 @@ Other uses, especially through `proxy`, run into limits that were never the focu
   with its own per-file stall timeouts and a force-close teardown watchdog; `proxy` has
   none, so recovery is killing the process.
 
-- **No outbound retransmission.** RDT is reliable inbound — the device resends when we
-  signal a gap — but the client-to-device direction has no retransmit buffer. A single
-  dropped outbound frame stalls the stream. `download` sends almost nothing upward (small
-  SMB requests) so it is unaffected, but proxying a port where the client pushes data to
-  the device can stall on packet loss, most likely on a lossy or high-RTT path and with
-  large transfers.
+- **Outbound throughput is device-bound, and large writes need chunking.** The client-to-device
+  direction has a go-back-N retransmit buffer with AIMD congestion control, so bulk uploads survive
+  loss — but the device's receive buffer is small, so sustained outbound throughput is capped at a
+  few hundred KB/s regardless of the path. A single application write larger than the congestion
+  window also deadlocks, since the device won't consume a partial write; `upload` chunks to stay
+  under it, but a client pushing large writes through raw `proxy` must do the same.
 
 - **One session, one client per port.** The device accepts a single remote Kalay session,
   so a running `proxy` or `download` occupies the scope — the phone app and the other tool
@@ -151,4 +179,4 @@ Other uses, especially through `proxy`, run into limits that were never the focu
 - `kalay/` — the reversed transport: control, session, dtls, rdt, tunnel.
 - `seestar/` — ZWO cloud auth and the tunnel dial.
 - `internal/tnauth/` — the `51cc` relay authorization and coordination channel.
-- `cmd/` — the two tools.
+- `cmd/` — the tools: `proxy`, `download`, `upload`.

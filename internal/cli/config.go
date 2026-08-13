@@ -28,6 +28,16 @@ func EnvOr(k, def string) string {
 	return def
 }
 
+// EnvIntOr returns the environment value for k parsed as an int, or def when unset or unparseable.
+func EnvIntOr(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
 // NoPrompt reports whether prompting is disabled, by flag or by SEESTAR_NO_PROMPT.
 func NoPrompt(flag bool) bool { return flag || os.Getenv("SEESTAR_NO_PROMPT") != "" }
 
