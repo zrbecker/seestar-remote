@@ -19,8 +19,8 @@ const (
 	gbnGiveUp = 30 * time.Second       // no ACK progress this long means the outbound stream is dead
 	rtoMin    = 250 * time.Millisecond // clamp so a bad RTT estimate cannot go haywire
 	rtoMax    = 3 * time.Second
-	cwndMin   = 4                       // never shrink the congestion window below this many frames
-	cwndInit  = 8                       // start conservative and let AIMD grow into the path
+	cwndMin   = 4 // never shrink the congestion window below this many frames
+	cwndInit  = 8 // start conservative and let AIMD grow into the path
 )
 
 // maxFrame caps each RDT payload so a DTLS record fits one UDP datagram; sendWindow is the hard

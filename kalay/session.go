@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/zrbecker/seestar-remote/internal/tnauth"
@@ -116,6 +117,8 @@ type Session struct {
 	coordSeen                     int
 
 	rdtVal []byte // 8-byte RDT connection value; keepalive resends the 2704 ack with it
+
+	lastRxNano int64 // UnixNano of the last packet received from the device; drives liveness detection
 
 	// Trace, if set, is called with each framed DTLS record in each direction ("TX"/"RX").
 	Trace func(dir string, data []byte)
@@ -545,7 +548,7 @@ func Dial(master string, dev DeviceIdentity) (*Session, *DialResult, error) {
 	fmt.Printf("  [RDT handshake: dev acked 2804 = %v (val=%x)]\n", gotRDT, rdtVal[:8])
 
 	s := &Session{pc: pc, dev: devAddr, master: masterAddr, token: token,
-		rdtVal: rdtVal,
+		rdtVal: rdtVal, lastRxNano: time.Now().UnixNano(),
 		stopKA: make(chan struct{}), knockPkt: knockPkt, directPkt: direct1, directPkt2: direct2, directPkt4: direct4,
 		preWire: preWire, preAddrs: preAddrs, relayChans: relayChans, relaySetup: relaySetup, stunWire: stunWire, stunAddrs: stunAddrs,
 		coordUID: coordUID, coordLocalIP: coordLocalIP, coordReflIP: coordReflIP, coordLocalPort: coordLocalPort, coordReflPort: coordReflPort}
@@ -620,6 +623,9 @@ func (s *Session) ReadFrom(b []byte) (int, net.Addr, error) {
 		if err != nil {
 			return 0, nil, err
 		}
+		if sameHost(from, s.dev) {
+			atomic.StoreInt64(&s.lastRxNano, time.Now().UnixNano()) // any device packet proves the link is alive
+		}
 		if ua, ok := from.(*net.UDPAddr); ok && ua.Port == 3478 {
 			s.handleRelay0103(buf[:n], from) // coordination continues during DTLS
 			continue
@@ -657,6 +663,12 @@ func (s *Session) Close() error {
 	}
 	return s.pc.Close()
 }
+
+// SinceLastRx reports how long ago the last packet from the device arrived.
+func (s *Session) SinceLastRx() time.Duration {
+	return time.Since(time.Unix(0, atomic.LoadInt64(&s.lastRxNano)))
+}
+
 func (s *Session) LocalAddr() net.Addr           { return s.pc.LocalAddr() }
 func (s *Session) SetDeadline(t time.Time) error { return s.pc.SetDeadline(t) }
 func (s *Session) SetWriteDeadline(t time.Time) error {

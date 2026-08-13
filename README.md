@@ -142,12 +142,12 @@ This is a reverse-engineered stack built around SMB bulk transfer — `download`
 plus request/response for JSON-RPC and Alpaca. Those paths are solid. Other uses, especially
 through raw `proxy`, run into limits that were never the focus:
 
-- **No liveness detection.** The tunnel sends keepalives at several layers but never reads
-  the replies, and nothing times out on silence. A tunnel that wedges mid-session does not
-  error — it goes quiet. A `proxy` client then hangs with no feedback, and a CIFS mount
-  over `proxy` can leave uninterruptible (D-state) processes. `download` works around this
-  with its own per-file stall timeouts and a force-close teardown watchdog; `proxy` has
-  none, so recovery is killing the process.
+- **Liveness is detected on silence, but not instantly, and there is no auto-reconnect.** The
+  tunnel fails itself if no packet arrives from the device for `KALAY_LIVENESS_TIMEOUT` (15s
+  default, 0 disables), so a wedged link surfaces as an error to `Read`/`Write` instead of hanging
+  forever — an idle device answers keepalives every ~150ms, so the timeout only trips on genuine
+  silence. But detection is bounded by that window, not immediate, and `proxy` does not redial: it
+  errors the affected client, which must reconnect.
 
 - **Outbound throughput is device-bound, and large writes need chunking.** The client-to-device
   direction has a go-back-N retransmit buffer with AIMD congestion control, so bulk uploads survive

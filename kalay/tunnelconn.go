@@ -282,6 +282,12 @@ func OpenTunnel(cfg TunnelConfig) (*Tunnel, error) {
 const tunMyConn = 0x01
 
 var tunDebug = os.Getenv("KALAY_TUN_DEBUG") != ""
+
+// livenessTimeout fails the tunnel if no packet arrives from the device for this long, so a wedged
+// link surfaces as an error to Read/Write/OpenChannel instead of hanging silently. An idle device
+// still answers our keepalives every ~150ms, so this only trips on genuine silence, uniformly for
+// idle, proxy, download, and upload. 0 disables it; override the seconds via KALAY_LIVENESS_TIMEOUT.
+var livenessTimeout = time.Duration(envInt("KALAY_LIVENESS_TIMEOUT", 15)) * time.Second
 var ackLogCount int // caps debug logging of inbound device control frames
 
 func (t *Tunnel) sendRDT(typ, b16, connID byte, seq uint64, payload []byte) {
@@ -377,6 +383,17 @@ func p2pConnectAddr(idx byte, port int) []byte {
 	return append([]byte{0x01, idx, 0x34, 0x00, 0x02, 0x00, byte(port >> 8), byte(port), 0x7f, 0x00, 0x00, 0x01}, make([]byte, 44)...)
 }
 
+// fail records err as the tunnel's terminal error (first writer wins) and closes it, unblocking
+// readers, writers, and pending channel opens.
+func (t *Tunnel) fail(err error) {
+	t.rmu.Lock()
+	if t.rerr == nil {
+		t.rerr = err
+	}
+	t.rmu.Unlock()
+	t.closeMu.Do(func() { close(t.closed) })
+}
+
 // pump is the sole owner of session I/O once the tunnel is ready: it keepalives, ACKs, demuxes and
 // routes inbound P2PTunnel messages, and sends queued outbound writes. It runs until Close.
 func (t *Tunnel) pump(buf []byte) {
@@ -401,9 +418,16 @@ func (t *Tunnel) pump(buf []byte) {
 			return
 		default:
 		}
+		if livenessTimeout > 0 && t.sess.SinceLastRx() > livenessTimeout {
+			if tunDebug {
+				fmt.Fprintf(os.Stderr, "[tun] liveness: no device packet in %s -> failing tunnel\n", t.sess.SinceLastRx())
+			}
+			t.fail(fmt.Errorf("kalay: no packet from device in %s; tunnel is dead", livenessTimeout))
+			return
+		}
 		if tunDebug && time.Since(lastHB) > 2*time.Second {
-			fmt.Fprintf(os.Stderr, "[tun] HB txSeq=%d appSeq=%d pumpNext=%d maxSeq=%d writeChLen=%d cwnd=%.1f inflight=%d rto=%s\n",
-				t.txSeq, t.appSeq, t.pumpNext, t.recv.MaxSeq(), len(t.writeCh), t.cwnd, t.txSeq-t.sendBase, t.rto)
+			fmt.Fprintf(os.Stderr, "[tun] HB txSeq=%d appSeq=%d pumpNext=%d maxSeq=%d writeChLen=%d cwnd=%.1f inflight=%d rto=%s sinceRx=%s\n",
+				t.txSeq, t.appSeq, t.pumpNext, t.recv.MaxSeq(), len(t.writeCh), t.cwnd, t.txSeq-t.sendBase, t.rto, t.sess.SinceLastRx())
 			lastHB = time.Now()
 		}
 		if time.Since(lastKA) > 400*time.Millisecond {
@@ -478,12 +502,7 @@ func (t *Tunnel) pump(buf []byte) {
 			t.recv.Add(f.Seq, f.Payload)
 		}
 		if err := t.outboundTick(); err != nil {
-			t.rmu.Lock()
-			if t.rerr == nil {
-				t.rerr = err
-			}
-			t.rmu.Unlock()
-			t.closeMu.Do(func() { close(t.closed) }) // unblock writers waiting on t.closed
+			t.fail(err)
 			return
 		}
 		// Consume the in-order prefix incrementally: Take frees each consumed frame, bounding memory
