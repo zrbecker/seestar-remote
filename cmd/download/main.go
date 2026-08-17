@@ -6,8 +6,10 @@
 // Env: SEESTAR_EMAIL, SEESTAR_PASSWORD, SEESTAR_MODEL,
 // SEESTAR_SN, SEESTAR_MASTER, OUTBASE (default ./seestar-archive), SHARE (default
 // "EMMC Images"), ROOT
-// (default "MyWorks"), SMB_USER (default Guest), SMB_PARALLEL (default 4), LIST_ONLY
-// (set = enumerate and write the manifest, no download).
+// (default "MyWorks"), SMB_USER (default Guest), SMB_PARALLEL (default 4),
+// MIN_FETCH_BPS (assumed throughput floor for per-file timeouts, default 400000; lower it on a
+// slow link so big files are not abandoned mid-transfer), LIST_ONLY (set = enumerate and write
+// the manifest, no download).
 //
 // Scope: TARGETS (comma-separated top-level dirs under ROOT; empty = all) and
 // EXCLUDE_EXT (comma-separated extensions to skip; empty = none). Both apply to the
@@ -124,6 +126,10 @@ func (dummyAddr) String() string  { return "seestar:445" }
 var (
 	readChunk = int64(1 << 20)
 	parallel  = envInt("SMB_PARALLEL", 4)
+	// fetchFloorBps is the assumed throughput floor used to size each file's hard timeout, so a
+	// large file that is still progressing is not killed prematurely. Lower it (MIN_FETCH_BPS) for
+	// a slow link where the default 400KB/s floor would abandon big files mid-transfer.
+	fetchFloorBps = int64(max(envInt("MIN_FETCH_BPS", 400_000), 1))
 )
 
 // Download scope: TARGETS names top-level directories under ROOT, EXCLUDE_EXT skips file
@@ -408,6 +414,9 @@ Environment:
         Set to write the manifest and stop, without downloading.
   SMB_PARALLEL
         Concurrent range reads per file (default 4).
+  MIN_FETCH_BPS
+        Assumed throughput floor for per-file timeouts (default 400000). Lower it on a
+        slow link so large files still-in-progress are not abandoned.
   SMB_USER
         SMB user (default Guest).
 %s
@@ -621,9 +630,9 @@ func main() {
 			os.MkdirAll(filepath.Dir(local), 0755)
 			fmt.Printf("  fetch %s (%.1f MB) ... ", child, float64(e.Size())/1e6)
 			// hardCap scales with size so a fixed ceiling cannot kill a large file that is
-			// still progressing: it allows a 400KB/s floor plus 90s slack. Genuine wedges
+			// still progressing: it allows a fetchFloorBps floor plus 90s slack. Genuine wedges
 			// are caught by stallGap instead.
-			hardCap := 90*time.Second + time.Duration(e.Size()/400_000)*time.Second
+			hardCap := 90*time.Second + time.Duration(e.Size()/fetchFloorBps)*time.Second
 			n, derr := fetchWithTimeout(fs, devPath(child), local, 25*time.Second, 90*time.Second, hardCap)
 			if derr != nil {
 				failCount[child]++
